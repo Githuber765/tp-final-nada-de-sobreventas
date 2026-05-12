@@ -1,0 +1,50 @@
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: marketplace
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  catalog:
+    build:
+      context: .
+      dockerfile: catalog/Dockerfile
+    ports:
+      - "8001:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: always
+
+  orders:
+    build:
+      context: .
+      dockerfile: orders/Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - rabbitmq
+      - catalog
+
+  notificaciones:
+    build:
+      context: .
+      dockerfile: notificaciones/Dockerfile
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - rabbitmq
