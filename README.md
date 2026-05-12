@@ -324,36 +324,21 @@ Durante el desarrollo se trabajó con:
 
 ---
 
-# IA Log
-
-## Uso de IA durante el desarrollo
-
-La IA fue utilizada como herramienta de apoyo para:
-
-* diagnóstico de errores Docker,
-* configuración de RabbitMQ,
-* debugging de networking entre contenedores,
-* generación de documentación,
-* comprensión conceptual de microservicios.
-
----
-
-## Correcciones realizadas manualmente
-
-Las principales correcciones manuales fueron:
-
-* estructura de Dockerfiles,
-* networking interno,
-* configuración MySQL,
-* resolución de dependencias Python,
-* organización del docker-compose.
-
---- 
 # IA Log: Registro de Interacciones y Correcciones
 
 ## Introducción
 
 Este apartado registra las interacciones clave con el asistente de IA durante el desarrollo del TP2, destacando los errores detectados y las decisiones arquitectónicas tomadas para garantizar la calidad, resiliencia y funcionamiento del sistema distribuido.
+
+## Uso de IA durante el desarrollo
+
+La IA fue utilizada como herramienta de apoyo para:
+
+- diagnóstico de errores Docker,
+- configuración de RabbitMQ,
+- debugging de networking entre contenedores,
+- generación de documentación,
+- comprensión conceptual de microservicios.
 
 ## Registro de Interacciones Críticas
 
@@ -379,9 +364,9 @@ Este apartado registra las interacciones clave con el asistente de IA durante el
 4. **Networking distribuido:** Dentro de Docker Compose los servicios se comunican mediante DNS interno y no mediante `localhost`.
 5. **Startup order:** El orden de inicio de servicios es crítico en arquitecturas distribuidas; un servicio puede fallar aunque la configuración sea correcta si la dependencia aún no terminó de iniciar.
 6. **Mensajería asíncrona:** RabbitMQ permite desacoplar productores y consumidores, aumentando resiliencia y tolerancia a fallos.
-7. **Debugging distribuido:** Diagnosticar problemas en microservicios es considerablemente más complejo que en un monolito debido a networking, contenedores y sincronización.
- 
- --- 
+7. **Debugging distribuido:** Diagnosticar problemas en microservicios es considerablemente más complejo que en un monolito debido a networking, contenedores y sincronización. 
+
+ ---
 # Conclusión
 
 El trabajo permitió comprender las diferencias entre una arquitectura monolítica y una arquitectura basada en microservicios.
