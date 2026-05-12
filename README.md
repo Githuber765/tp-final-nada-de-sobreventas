@@ -1,8 +1,3 @@
-Armé una versión limpia y completa, corrigiendo el problema de formato que tenía tu sección `.proto` y dejando el IA Log dentro del README como pide la consigna. Está basada en tu README actual. 
-
-Copiá y pegá TODO esto en `README.md`:
-
-````md
 # TP2 — Arquitectura de Microservicios para Market-Place-Inc
 
 ## Sistemas Distribuidos — TP2
@@ -714,5 +709,3 @@ También se observaron nuevas complejidades:
 - identificación de puntos únicos de falla.
 
 Finalmente, el TP permitió aplicar herramientas modernas utilizadas en entornos reales de desarrollo distribuido y DevOps, como Docker, Docker Compose, RabbitMQ, FastAPI, MySQL, gRPC y Kubernetes.
-
-````
