@@ -1,236 +1,217 @@
-# TP2 — Arquitectura de Microservicios para Market-Place-Inc
+# TP Final — Nada de Sobreventas
 
-## Sistemas Distribuidos — TP2
+## Sistemas Distribuidos
 
 ## Integrantes
 
-- Ezequiel Castro Burgos
-- Emmanuel Orozco
+* Ezequiel Castro Burgos
+* Emmanuel Orozco
 
 ---
 
 # Introducción
 
-Este trabajo práctico tiene como objetivo transformar una arquitectura monolítica en una arquitectura basada en microservicios utilizando tecnologías modernas de sistemas distribuidos.
+Este proyecto implementa una solución distribuida para evitar el problema de **sobreventa de productos** (*overselling*) en un sistema de comercio electrónico.
 
-El caso de estudio corresponde a **Market-Place-Inc**, una plataforma de e-commerce que originalmente presentaba problemas de escalabilidad, acoplamiento y fallas en cascada durante eventos de alta concurrencia, como el Hot Sale.
+El sistema parte de una arquitectura basada en microservicios y agrega un mecanismo de reserva de stock mediante **Redis Lock**, con pruebas concurrentes, monitoreo con **Prometheus y Grafana**, pruebas de carga con **Locust** y automatización de tests con **GitHub Actions**.
 
-A partir de esta problemática se desarrolló una solución basada en:
-
-- separación de servicios,
-- contenedorización,
-- comunicación síncrona entre servicios,
-- mensajería asíncrona,
-- orquestación básica,
-- persistencia con base de datos,
-- y desacoplamiento entre módulos.
+El objetivo principal es asegurar que, aunque muchos usuarios intenten reservar un mismo producto al mismo tiempo, el stock nunca quede negativo y no se vendan más unidades de las disponibles.
 
 ---
 
-# Objetivos del TP
+# Problema: Overselling
 
-- Separar funcionalidades del monolito en microservicios independientes.
-- Implementar comunicación síncrona y asíncrona.
-- Utilizar Docker y Docker Compose para la ejecución distribuida.
-- Incorporar RabbitMQ como broker de mensajería.
-- Simular un entorno distribuido con múltiples servicios.
-- Documentar un contrato `.proto` para comunicación gRPC.
-- Incluir manifiestos básicos de Kubernetes.
-- Identificar puntos únicos de falla.
-- Comprender problemas reales de sistemas distribuidos.
+El **overselling** ocurre cuando el sistema vende más unidades de un producto que las realmente disponibles en stock.
 
----
-
-# Arquitectura del Sistema
-
-La arquitectura implementada se compone de los siguientes servicios:
-
-| Servicio | Responsabilidad |
-| :--- | :--- |
-| Catalog Service | Gestión y consulta de productos |
-| Orders Service | Creación de pedidos |
-| RabbitMQ | Broker de mensajería |
-| MySQL | Persistencia de datos |
-| Notification Service | Consumo de eventos asincrónicos |
-| Payments Service | Servicio preparado para lógica de pagos |
-
----
-
-## Diagrama de arquitectura
-
-El sistema se ejecuta dentro de una red de Docker Compose. La arquitectura combina comunicación síncrona entre servicios y comunicación asíncrona mediante RabbitMQ.
-
-![Diagrama de arquitectura](./docs/arquitectura.png)
-
----
-
-## SPOFs identificados
-
-Se identificaron los siguientes puntos únicos de falla (**SPOF**, Single Point of Failure):
-
-- **MySQL**: si la base de datos se cae, los servicios que dependen de persistencia no pueden consultar ni guardar información.
-- **RabbitMQ**: si el broker falla, la comunicación asíncrona se interrumpe y los eventos dejan de publicarse o consumirse.
-
-Estos componentes son críticos porque en esta implementación académica no cuentan con redundancia ni alta disponibilidad.
-
----
-
-# Comunicación entre Servicios
-
-## Comunicación síncrona
-
-La comunicación síncrona ocurre cuando un servicio necesita una respuesta inmediata de otro servicio para continuar su operación.
-
-En este proyecto, el flujo principal síncrono es:
+Ejemplo:
 
 ```text
-Usuario → Orders Service → Catalog Service
+Stock disponible: 1 unidad
+Usuario A intenta comprar 1 unidad
+Usuario B intenta comprar 1 unidad al mismo tiempo
 ```
 
-Características:
+Si ambos procesos leen el stock antes de que se actualice, los dos podrían confirmar la compra y el stock terminaría en negativo.
 
-- request-response,
-- dependencia inmediata,
-- bloqueo hasta obtener respuesta,
-- menor complejidad inicial,
-- mayor acoplamiento temporal.
+Este problema es grave porque puede generar:
+
+* ventas imposibles de cumplir;
+* inconsistencias en inventario;
+* reclamos de clientes;
+* pérdida de confianza;
+* errores en la operación del negocio.
 
 ---
 
-## Comunicación asíncrona
+# Solución Implementada
 
-La comunicación asíncrona se implementó mediante RabbitMQ.
+Se agregó un endpoint de reserva:
 
-Flujo:
+```http
+POST /reserve
+```
+
+Este endpoint utiliza un **candado distribuido con Redis** para evitar que dos usuarios modifiquen el stock del mismo producto al mismo tiempo.
+
+Flujo general:
 
 ```text
-Orders Service → RabbitMQ → Notification Service
+Cliente / Locust / Swagger
+        ↓
+Catalog Service - POST /reserve
+        ↓
+Redis Lock
+        ↓
+MySQL - Tabla productos
+        ↓
+Respuesta HTTP
 ```
-
-Funcionamiento:
-
-1. Orders Service crea el pedido.
-2. Orders Service publica un evento en RabbitMQ.
-3. RabbitMQ almacena el mensaje en la cola `orders`.
-4. Notification Service consume el mensaje de forma desacoplada.
-
-Ventajas:
-
-- desacoplamiento,
-- resiliencia,
-- tolerancia a fallos,
-- procesamiento en background,
-- menor impacto de latencia,
-- posibilidad de procesar eventos aunque el consumidor no esté activo en ese momento.
 
 ---
 
-## Comunicación síncrona vs asíncrona
+# Funcionamiento de `/reserve`
 
-| Flujo | Tipo | Tecnología | Justificación |
-| :--- | :--- | :--- | :--- |
-| Usuario → Orders Service | Síncrona | HTTP REST | El usuario necesita una respuesta inmediata al crear un pedido. |
-| Orders Service → Catalog Service | Síncrona | REST / gRPC documentado | Orders necesita consultar el producto antes de confirmar el pedido. |
-| Orders Service → RabbitMQ | Asíncrona | RabbitMQ | El evento del pedido se publica sin bloquear el request principal. |
-| RabbitMQ → Notification Service | Asíncrona | Cola de mensajes | El consumidor procesa mensajes desacoplado del flujo principal. |
+El endpoint realiza los siguientes pasos:
+
+1. Recibe `product_id` y `quantity`.
+2. Intenta tomar un lock en Redis.
+3. Si el lock está ocupado, espera brevemente y reintenta.
+4. Si obtiene el lock, consulta el producto en MySQL.
+5. Verifica si hay stock suficiente.
+6. Si hay stock, descuenta la cantidad solicitada.
+7. Si no hay stock, rechaza la operación.
+8. Libera el lock.
+9. Devuelve la respuesta correspondiente.
+
+Ejemplo de body:
+
+```json
+{
+  "product_id": 1,
+  "quantity": 1
+}
+```
+
+Respuesta exitosa:
+
+```json
+{
+  "status": "reserved",
+  "product_id": 1,
+  "quantity": 1,
+  "stock_remaining": 4
+}
+```
+
+Respuesta sin stock:
+
+```json
+{
+  "detail": "Sin stock suficiente"
+}
+```
+
+---
+
+# Redis Lock
+
+La reserva usa Redis con la operación:
+
+```python
+redis.set(lock_key, lock_value, nx=True, ex=5)
+```
+
+Significado:
+
+| Parámetro    | Significado                                  |
+| ------------ | -------------------------------------------- |
+| `lock_key`   | Clave del candado, asociada al producto      |
+| `lock_value` | Valor guardado en Redis                      |
+| `nx=True`    | Solo crea la clave si todavía no existe      |
+| `ex=5`       | El lock expira automáticamente en 5 segundos |
+
+Esto permite que solo una operación de reserva modifique el stock de un producto a la vez.
+
+---
+
+# Arquitectura del Proyecto
+
+La arquitectura se compone de los siguientes servicios:
+
+| Servicio             | Responsabilidad                                  |
+| -------------------- | ------------------------------------------------ |
+| Catalog Service      | Gestión de productos, stock, reservas y métricas |
+| Orders Service       | Servicio de pedidos del sistema base             |
+| Notification Service | Servicio preparado para consumir eventos         |
+| RabbitMQ             | Broker de mensajería del sistema base            |
+| MySQL                | Persistencia de productos y stock                |
+| Redis                | Candado distribuido para evitar sobreventas      |
+| Prometheus           | Recolección de métricas                          |
+| Grafana              | Visualización de métricas                        |
+| Locust               | Pruebas de carga                                 |
+| GitHub Actions       | Ejecución automática de tests                    |
 
 ---
 
 # Tecnologías Utilizadas
 
-| Tecnología | Uso |
-| :--- | :--- |
-| Python | Lenguaje principal |
-| FastAPI | Framework backend |
-| Docker | Contenedores |
-| Docker Compose | Orquestación local |
-| RabbitMQ | Broker de mensajería |
-| MySQL | Base de datos |
-| SQLAlchemy | ORM |
-| aiomysql | Driver asincrónico para MySQL |
-| Pika | Cliente RabbitMQ |
-| Kubernetes | Orquestación |
-| gRPC / Protobuf | Contrato de comunicación entre servicios |
-| Swagger / OpenAPI | Documentación de APIs |
-| Locust | Pruebas de carga |
-
----
-
-# Contrato gRPC / Protobuf
-
-El proyecto incluye un archivo `.proto` para documentar el contrato de comunicación entre servicios.
-
-El archivo se encuentra en:
-
-```text
-grpc/catalog.proto
-```
-
-Este contrato permite definir una interfaz clara y tipada para comunicación entre servicios.
-
-## Comando de generación
-
-Para generar los archivos Python a partir del contrato `.proto`, se puede utilizar el siguiente comando:
-
-```bash
-python -m grpc_tools.protoc -I./grpc --python_out=. --grpc_python_out=. ./grpc/catalog.proto
-```
-
-Este comando toma como entrada el archivo `catalog.proto` y genera el código necesario para usar gRPC desde Python.
+| Tecnología     | Uso                          |
+| -------------- | ---------------------------- |
+| Python         | Lenguaje principal           |
+| FastAPI        | Implementación de APIs       |
+| MySQL          | Base de datos                |
+| SQLAlchemy     | ORM                          |
+| Redis          | Lock distribuido             |
+| Docker         | Contenedores                 |
+| Docker Compose | Ejecución local de servicios |
+| Prometheus     | Recolección de métricas      |
+| Grafana        | Dashboard de monitoreo       |
+| Locust         | Pruebas de carga             |
+| Pytest         | Tests automatizados          |
+| GitHub Actions | Integración continua         |
 
 ---
 
 # Estructura del Proyecto
 
 ```text
-tp1-market-place-main/
+tp-final-nada-de-sobreventas/
 │
 ├── catalog/
 │   ├── api/
+│   │   ├── products.py
+│   │   └── reserve.py
 │   ├── database/
+│   │   ├── connection.py
+│   │   └── init.py
 │   ├── models/
+│   │   └── product.py
 │   ├── app.py
+│   ├── metrics.py
 │   └── Dockerfile
 │
 ├── orders/
-│   ├── api/
-│   ├── database/
-│   ├── models/
-│   ├── services/
-│   ├── app.py
-│   └── Dockerfile
+│   └── ...
 │
 ├── notificaciones/
-│   ├── services/
-│   └── Dockerfile
-│
-├── payments/
-│   ├── api/
-│   ├── config/
-│   ├── database/
-│   ├── models/
-│   └── services/
+│   └── ...
 │
 ├── events/
-│   ├── connection.py
-│   ├── contracts.py
-│   └── publisher.py
+│   └── ...
 │
-├── grpc/
-│   └── catalog.proto
-│
-├── k8s/
-│   ├── orders-deployment.yaml
-│   ├── orders-service.yaml
-│   └── rabbitmq.yaml
+├── prometheus/
+│   └── prometheus.yml
 │
 ├── tests/
-├── docs/
-│   └── arquitectura.png
+│   └── test_reserve.py
+│
+├── .github/
+│   └── workflows/
+│       └── ci-cd.yml
 │
 ├── docker-compose.yml
+├── locustfile_reserve.py
 ├── requirements.txt
-├── INFORME_TP2.md
 └── README.md
 ```
 
@@ -240,14 +221,14 @@ tp1-market-place-main/
 
 ## Requisitos
 
-- Docker Desktop instalado y en ejecución.
-- Docker Compose.
-- Python 3.11 o superior.
-- Opcional: Kubernetes habilitado en Docker Desktop para probar manifiestos K8s.
+* Docker Desktop instalado y en ejecución.
+* Python 3.11 o superior.
+* Docker Compose.
+* Navegador web.
 
 ---
 
-## Levantar el entorno
+## Levantar el sistema
 
 Desde la raíz del proyecto:
 
@@ -255,11 +236,11 @@ Desde la raíz del proyecto:
 docker compose up --build
 ```
 
-Este comando construye las imágenes y levanta los servicios definidos en `docker-compose.yml`.
+Este comando construye las imágenes y levanta los contenedores definidos en `docker-compose.yml`.
 
 ---
 
-## Detener el entorno
+## Detener el sistema
 
 ```bash
 docker compose down
@@ -269,31 +250,43 @@ docker compose down
 
 # Servicios Disponibles
 
-| Servicio | URL |
-| :--- | :--- |
-| Orders Service | http://localhost:8000/docs |
-| Catalog Service | http://localhost:8001/docs |
-| RabbitMQ Dashboard | http://localhost:15672 |
+| Servicio           | URL                        |
+| ------------------ | -------------------------- |
+| Catalog Swagger    | http://localhost:8001/docs |
+| Orders Swagger     | http://localhost:8000/docs |
+| Prometheus         | http://localhost:9090      |
+| Grafana            | http://localhost:3000      |
+| Locust             | http://localhost:8089      |
+| RabbitMQ Dashboard | http://localhost:15672     |
 
----
-
-# Credenciales RabbitMQ
+Credenciales por defecto de RabbitMQ:
 
 ```text
 usuario: guest
 password: guest
 ```
 
+Credenciales por defecto de Grafana:
+
+```text
+usuario: admin
+password: admin
+```
+
 ---
 
-# Ejemplo de Flujo End-to-End
+# Prueba Manual de Reserva
 
-## 1. Crear pedido
+Ingresar a:
 
-Endpoint:
+```text
+http://localhost:8001/docs
+```
+
+Ejecutar:
 
 ```http
-POST /orders
+POST /reserve
 ```
 
 Body:
@@ -305,407 +298,266 @@ Body:
 }
 ```
 
----
-
-## 2. Respuesta esperada
+También se puede probar un caso sin stock:
 
 ```json
 {
-  "message": "Pedido creado",
-  "order_id": "...",
-  "event_sent": true
+  "product_id": 1,
+  "quantity": 999
+}
+```
+
+El sistema debe rechazar la operación con:
+
+```json
+{
+  "detail": "Sin stock suficiente"
 }
 ```
 
 ---
 
-## 3. Verificar RabbitMQ
+# Tests Automatizados
 
-Ingresar a:
-
-```text
-http://localhost:15672
-```
-
-Luego ir a:
+Los tests se encuentran en:
 
 ```text
-Queues and Streams → orders
+tests/test_reserve.py
 ```
 
-Si el flujo fue exitoso, se debe observar un mensaje en la cola `orders`.
-
----
-
-# Scripts de Demo
-
-## Crear un pedido con curl
-
-### Windows PowerShell
-
-```powershell
-curl.exe -X POST http://localhost:8000/orders `
-  -H "Content-Type: application/json" `
-  -d "{\"product_id\":1,\"quantity\":1}"
-```
-
-### Git Bash / Linux / macOS
+Ejecutar:
 
 ```bash
-curl -X POST http://localhost:8000/orders \
-  -H "Content-Type: application/json" \
-  -d '{"product_id":1,"quantity":1}'
+pytest -v tests/test_reserve.py
 ```
 
----
+Los tests validan:
 
-## Ver contenedores activos
+1. Dos usuarios intentan reservar el mismo producto con stock 1.
+2. Cincuenta usuarios intentan reservar productos con stock limitado.
+3. El endpoint responde rápidamente.
 
-```bash
-docker compose ps
-```
-
----
-
-## Ver logs del sistema
-
-```bash
-docker compose logs -f
-```
-
----
-
-## Ver cola en RabbitMQ
-
-Abrir en navegador:
+Resultado esperado:
 
 ```text
-http://localhost:15672
+3 passed
 ```
 
-Credenciales:
+---
+
+# GitHub Actions
+
+El proyecto incluye un workflow de CI en:
 
 ```text
-usuario: guest
-password: guest
+.github/workflows/ci-cd.yml
+```
+
+Este workflow se ejecuta automáticamente al hacer `push` sobre la rama `main`.
+
+El pipeline realiza:
+
+1. Checkout del repositorio.
+2. Instalación de Python.
+3. Instalación de dependencias.
+4. Levantamiento del sistema con Docker Compose.
+5. Ejecución de tests con Pytest.
+6. Apagado de contenedores.
+
+El resultado esperado es que GitHub Actions muestre el estado en verde.
+
+---
+
+# Métricas con Prometheus
+
+El servicio Catalog expone métricas en:
+
+```text
+http://localhost:8001/metrics
+```
+
+Prometheus las recolecta desde:
+
+```text
+catalog:8000/metrics
+```
+
+Archivo de configuración:
+
+```text
+prometheus/prometheus.yml
+```
+
+Métricas principales:
+
+| Métrica                      | Descripción                                     |
+| ---------------------------- | ----------------------------------------------- |
+| `reserve_attempts_total`     | Cantidad de intentos de reserva según resultado |
+| `reserve_duration_seconds`   | Duración de las operaciones de reserva          |
+| `inventory_stock_level`      | Stock actual por producto                       |
+| `overselling_attempts_total` | Cantidad de sobreventas detectadas              |
+
+La métrica más importante del TP es:
+
+```text
+overselling_attempts_total
+```
+
+Debe mantenerse en:
+
+```text
+0
+```
+
+---
+
+# Dashboard en Grafana
+
+Grafana se utiliza para visualizar las métricas recolectadas por Prometheus.
+
+URL:
+
+```text
+http://localhost:3000
+```
+
+Datasource configurado:
+
+```text
+http://prometheus:9090
+```
+
+Paneles creados:
+
+| Panel                          | Métrica                          |
+| ------------------------------ | -------------------------------- |
+| Reservas exitosas y rechazadas | `reserve_attempts_total`         |
+| Stock actual por producto      | `inventory_stock_level`          |
+| Cantidad de reservas medidas   | `reserve_duration_seconds_count` |
+| Intentos de sobreventa         | `overselling_attempts_total`     |
+
+El dashboard permite verificar visualmente que, incluso bajo carga, los intentos de sobreventa se mantienen en 0.
+
+---
+
+# Prueba de Carga con Locust
+
+El archivo de prueba de carga es:
+
+```text
+locustfile_reserve.py
+```
+
+Ejecutar:
+
+```bash
+locust -f locustfile_reserve.py --host=http://localhost:8001
 ```
 
 Luego ingresar a:
 
 ```text
-Queues and Streams → orders
+http://localhost:8089
 ```
+
+Configuración utilizada:
+
+```text
+Number of users: 50
+Spawn rate: 5
+Host: http://localhost:8001
+```
+
+La prueba realiza múltiples solicitudes concurrentes al endpoint:
+
+```http
+POST /reserve
+```
+
+Durante la prueba se espera observar:
+
+* muchos intentos de reserva;
+* reservas exitosas hasta agotar stock;
+* rechazos por falta de stock;
+* 0% de failures técnicos en Locust;
+* `overselling_attempts_total = 0` en Grafana.
 
 ---
 
-## Simular falla de un contenedor
+# Teorema CAP aplicado al inventario
 
-Para probar reinicio automático de un contenedor:
+En un sistema distribuido, ante una falla de comunicación o partición de red, no siempre se pueden garantizar simultáneamente consistencia, disponibilidad y tolerancia a particiones.
+
+Aplicado al inventario:
+
+* Priorizar **consistencia** significa no aceptar reservas si no se puede verificar correctamente el stock.
+* Priorizar **disponibilidad** significa aceptar operaciones aunque no se pueda confirmar completamente el estado del stock.
+
+En este proyecto se prioriza la **consistencia**, ya que el sistema rechaza operaciones cuando no puede asegurar que el stock sea válido. Esto evita confirmar ventas que podrían producir sobreventa.
+
+---
+
+# Resultados Obtenidos
+
+Se validó que:
+
+* el endpoint `/reserve` descuenta stock correctamente;
+* las reservas sin stock son rechazadas;
+* los tests concurrentes pasan correctamente;
+* GitHub Actions ejecuta los tests de forma automática;
+* Prometheus recolecta métricas del servicio Catalog;
+* Grafana muestra el comportamiento del sistema;
+* Locust permite simular usuarios concurrentes;
+* la métrica `overselling_attempts_total` se mantiene en 0.
+
+---
+
+# Comandos Útiles
+
+Levantar servicios:
 
 ```bash
-docker kill tp1-market-place-main-catalog-1
+docker compose up --build
 ```
 
-Luego verificar el estado:
+Detener servicios:
+
+```bash
+docker compose down
+```
+
+Ver contenedores:
 
 ```bash
 docker compose ps
 ```
 
----
-
-# Docker y Contenedores
-
-Cada microservicio posee su propio:
-
-- Dockerfile,
-- proceso independiente,
-- entorno aislado,
-- dependencias específicas.
-
-Docker Compose permite:
-
-- levantar todos los servicios,
-- crear una red interna,
-- comunicar contenedores por nombre de servicio,
-- administrar dependencias,
-- simplificar el entorno distribuido.
-
-Un punto importante del desarrollo fue reemplazar `localhost` por nombres de servicio internos, por ejemplo:
-
-```text
-mysql
-rabbitmq
-catalog
-```
-
-Dentro de Docker Compose, `localhost` representa el propio contenedor, no la máquina host ni otro servicio.
-
----
-
-# Kubernetes
-
-El proyecto incluye manifiestos básicos de Kubernetes dentro de la carpeta:
-
-```text
-k8s/
-```
-
-Se incluyen recursos como:
-
-- Deployment,
-- Service,
-- manifiesto para RabbitMQ.
-
-Conceptos aplicados:
-
-- service discovery,
-- self-healing,
-- separación de pods,
-- comunicación interna,
-- despliegue declarativo.
-
----
-
-## Comandos Kubernetes
-
-Aplicar los manifiestos:
+Ver logs:
 
 ```bash
-kubectl apply -f k8s/
+docker compose logs -f
 ```
 
-Ver pods:
+Ejecutar tests:
 
 ```bash
-kubectl get pods
+pytest -v tests/test_reserve.py
 ```
 
-Ver services:
+Ejecutar Locust:
 
 ```bash
-kubectl get services
+locust -f locustfile_reserve.py --host=http://localhost:8001
 ```
-
-Eliminar un pod para probar self-healing:
-
-```bash
-kubectl delete pod <nombre-del-pod>
-```
-
-Verificar que Kubernetes lo recrea:
-
-```bash
-kubectl get pods
-```
-
----
-
-# Validación End-to-End
-
-Se validó el flujo completo del sistema:
-
-1. El usuario envía un `POST /orders`.
-2. Orders Service recibe el pedido.
-3. Orders Service consulta el catálogo.
-4. Se genera el pedido.
-5. Se publica un evento en RabbitMQ.
-6. El mensaje queda visible en la cola `orders`.
-7. El sistema confirma la creación del pedido mediante respuesta HTTP.
-
-Esto demuestra integración entre servicios, persistencia y comunicación asíncrona.
-
----
-
-# Problemas Encontrados y Soluciones
-
-## 1. Dockerfiles vacíos o incompletos
-
-Problema:
-
-- Docker Compose no podía construir imágenes porque algunos Dockerfiles estaban vacíos o no existían.
-
-Solución:
-
-- Se crearon Dockerfiles individuales para cada microservicio.
-- Se corrigieron las rutas de build en `docker-compose.yml`.
-
----
-
-## 2. Error con dependencias RabbitMQ
-
-Problema:
-
-- El servicio de órdenes fallaba porque no encontraba el módulo `pika`.
-
-Solución:
-
-- Se agregó `pika` al archivo `requirements.txt`.
-- Se reconstruyeron las imágenes Docker.
-
----
-
-## 3. Conexión MySQL entre contenedores
-
-Problema:
-
-- Los servicios intentaban conectarse a MySQL usando `localhost`.
-
-Solución:
-
-- Se reemplazó `localhost` por el hostname interno de Docker Compose:
-
-```text
-mysql
-```
-
----
-
-## 4. Error de autenticación MySQL
-
-Problema:
-
-- SQLAlchemy intentaba conectarse sin contraseña o con credenciales incorrectas.
-
-Solución:
-
-- Se corrigió la URL de conexión agregando usuario y contraseña:
-
-```text
-root:root
-```
-
----
-
-## 5. Dependencia `cryptography`
-
-Problema:
-
-- MySQL 8 utiliza mecanismos modernos de autenticación que requieren soporte adicional desde Python.
-
-Solución:
-
-- Se agregó `cryptography` a `requirements.txt`.
-
----
-
-## 6. Orden de inicio de servicios
-
-Problema:
-
-- Algunos servicios intentaban conectarse a MySQL antes de que la base de datos terminara de iniciar.
-
-Solución:
-
-- Se agregó `depends_on`.
-- Se configuró reinicio automático con `restart: always`.
-- Se agregó healthcheck para mejorar la espera de MySQL.
-
----
-
-# Conceptos de Sistemas Distribuidos Aplicados
-
-Durante el desarrollo se trabajó con:
-
-- desacoplamiento,
-- colas de mensajes,
-- comunicación síncrona,
-- comunicación asíncrona,
-- contenedorización,
-- fallas distribuidas,
-- service discovery,
-- aislamiento de servicios,
-- resiliencia,
-- arquitectura basada en eventos,
-- puntos únicos de falla,
-- debugging distribuido.
-
----
-
-# Limitaciones de la Implementación
-
-Esta implementación corresponde a un entorno académico y local. Algunas limitaciones actuales son:
-
-- MySQL y RabbitMQ se ejecutan como instancias únicas, por lo que siguen siendo SPOFs.
-- No se implementó alta disponibilidad real.
-- No se implementó autenticación entre servicios.
-- Kubernetes se incluye con manifiestos básicos.
-- El sistema prioriza mostrar comunicación distribuida, contenedores y mensajería antes que cubrir todos los casos productivos.
-- La observabilidad se encuentra documentada y parcialmente estructurada, pero no se implementó un stack completo como Prometheus, Grafana o Jaeger.
-
----
-
-# IA Log: Registro de Interacciones y Correcciones
-
-## Introducción
-
-Este apartado registra las interacciones clave con el asistente de IA durante el desarrollo del TP2, destacando los errores detectados y las decisiones arquitectónicas tomadas para garantizar la calidad, resiliencia y funcionamiento del sistema distribuido.
-
-## Uso de IA durante el desarrollo
-
-La IA fue utilizada como herramienta de apoyo para:
-
-- diagnóstico de errores Docker,
-- configuración de RabbitMQ,
-- debugging de networking entre contenedores,
-- generación de documentación,
-- comprensión conceptual de microservicios,
-- análisis de problemas de comunicación distribuida.
-
----
-
-## Registro de Interacciones Críticas
-
-| Fecha | Tarea | Error detectado por la IA / Humano | Corrección aplicada |
-| :--- | :--- | :--- | :--- |
-| 02/05 | Fase 3 Pagos | Inconsistencia: Modelo `Payment` con Integer ID vs `PaymentService` con UUID string. | Se modificó el modelo `Payment` para aceptar String UUID y mantener consistencia en sistemas distribuidos. |
-| 02/05 | Fase 3 Pagos | Consultas SQL crudas fallaban con `MissingGreenlet` y uso incorrecto de `select(Payment)`. | Se refactorizó la capa de persistencia para utilizar `select(Payment)` de SQLAlchemy correctamente en contexto asíncrono. |
-| 02/05 | Fase 3 Pagos | El `webhook_handler` no inyectaba la sesión de DB porque faltaba `Depends(get_db)`. | Se inyectó la dependencia `db: AsyncSession` correctamente en el handler. |
-| 02/05 | Integración | Conflicto de rutas: `main.py` y `orders/api/orders.py` registraban la misma ruta `/orders`. | Se limpió `main.py`, eliminando lógica antigua y delegando exclusivamente al router de `orders`. |
-| 12/05 | Docker Compose | Los servicios no iniciaban porque algunos Dockerfiles estaban vacíos o ausentes. | Se crearon Dockerfiles individuales para cada microservicio y se corrigieron rutas de build en `docker-compose.yml`. |
-| 12/05 | Networking Docker | Los contenedores intentaban conectarse utilizando `localhost`, provocando errores de conexión entre servicios. | Se reemplazó `localhost` por hostnames internos como `mysql` y `rabbitmq`. |
-| 12/05 | RabbitMQ | El contenedor de órdenes fallaba por ausencia del módulo `pika`. | Se agregó `pika` a `requirements.txt` y se reconstruyeron las imágenes Docker. |
-| 12/05 | Persistencia MySQL | SQLAlchemy no podía autenticarse contra MySQL con el usuario `root`. | Se corrigió la URL de conexión agregando usuario y contraseña `root:root`. |
-| 12/05 | Dependencias Python | `aiomysql` requería el paquete `cryptography` para autenticación moderna de MySQL 8. | Se agregó `cryptography` a `requirements.txt`. |
-| 12/05 | Startup distribuido | Los servicios intentaban conectarse a MySQL antes de que el contenedor terminara de iniciar. | Se implementó `healthcheck`, `depends_on` y `restart: always` en Docker Compose. |
-| 12/05 | RabbitMQ | Se necesitaba validar persistencia y desacoplamiento de mensajes. | Se probó el flujo end-to-end mediante `POST /orders`, verificando la cola `orders` en RabbitMQ Dashboard. |
-
----
-
-## Aprendizajes
-
-1. **Idempotencia:** la IA suele omitirla por defecto en consumers. Es obligatorio verificarla en flujos asíncronos.
-2. **Timeouts:** es fundamental configurar timeouts explícitos en llamadas síncronas entre servicios para evitar cascading failures.
-3. **Tipado:** en sistemas distribuidos, la inconsistencia entre UUIDs e Integers puede romper la persistencia y el tracing.
-4. **Networking distribuido:** dentro de Docker Compose los servicios se comunican mediante DNS interno y no mediante `localhost`.
-5. **Startup order:** el orden de inicio de servicios es crítico. Un servicio puede fallar aunque la configuración sea correcta si la dependencia todavía no terminó de iniciar.
-6. **Mensajería asíncrona:** RabbitMQ permite desacoplar productores y consumidores, aumentando resiliencia y tolerancia a fallos.
-7. **Debugging distribuido:** diagnosticar problemas en microservicios es más complejo que en un monolito debido a networking, contenedores, logs separados y sincronización entre servicios.
-8. **Supervisión humana:** la IA fue útil para orientar el diagnóstico, pero varias correcciones requirieron validación manual, ejecución real y revisión de logs.
 
 ---
 
 # Conclusión
 
-El trabajo permitió comprender las diferencias entre una arquitectura monolítica y una arquitectura basada en microservicios.
+El trabajo permitió implementar una solución concreta para evitar sobreventas en un entorno distribuido.
 
-La implementación mostró ventajas importantes:
+La incorporación de Redis como candado distribuido permitió controlar el acceso concurrente al stock de productos. Los tests automatizados demostraron que, aun con múltiples usuarios intentando reservar al mismo tiempo, el stock no queda negativo.
 
-- desacoplamiento,
-- escalabilidad,
-- resiliencia,
-- separación de responsabilidades,
-- posibilidad de procesamiento asíncrono,
-- independencia parcial entre servicios.
+Además, se incorporó observabilidad mediante Prometheus y Grafana, lo que permitió monitorear reservas, stock e intentos de sobreventa. Finalmente, la prueba de carga con Locust permitió validar el comportamiento del sistema bajo concurrencia.
 
-También se observaron nuevas complejidades:
-
-- networking distribuido,
-- sincronización entre servicios,
-- dependencias entre contenedores,
-- manejo de colas,
-- debugging distribuido,
-- necesidad de observabilidad,
-- identificación de puntos únicos de falla.
-
-Finalmente, el TP permitió aplicar herramientas modernas utilizadas en entornos reales de desarrollo distribuido y DevOps, como Docker, Docker Compose, RabbitMQ, FastAPI, MySQL, gRPC y Kubernetes.
+El resultado final es una solución académica funcional que integra microservicios, contenedores, locks distribuidos, pruebas automatizadas, CI/CD y monitoreo.
