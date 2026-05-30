@@ -26,7 +26,9 @@ services:
       - "8001:8000"
     depends_on:
       mysql:
-        condition: service_healthy
+        condition: service_healthy 
+      redis:
+        condition: service_started
     restart: always
 
   orders:
@@ -47,4 +49,9 @@ services:
     environment:
       - PYTHONPATH=/app
     depends_on:
-      - rabbitmq
+      - rabbitmq 
+  
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
