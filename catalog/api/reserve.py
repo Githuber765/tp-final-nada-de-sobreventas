@@ -1,5 +1,12 @@
 import asyncio
-import time
+import time  
+
+from catalog.metrics import (
+    reserve_attempts_total,
+    reserve_duration_seconds,
+    inventory_stock_level,
+    overselling_attempts_total
+)
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -25,77 +32,93 @@ class ReserveRequest(BaseModel):
     product_id: int
     quantity: int
 
-
+ 
 @router.post("/reserve")
 async def reserve_product(request: ReserveRequest, db: AsyncSession = Depends(get_db)):
-    if request.quantity <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="La cantidad debe ser mayor a 0"
-        )
-
-    lock_key = f"lock:product:{request.product_id}"
-    lock_value = "reserved"
-
-    lock_acquired = False
-    start_time = time.time()
-
-    while time.time() - start_time < 5:
-        try:
-            lock_acquired = redis_client.set(
-                lock_key,
-                lock_value,
-                nx=True,
-                ex=5
-            )
-        except redis.exceptions.RedisError:
-            raise HTTPException(
-                status_code=503,
-                detail="Redis no disponible. Reintentá más tarde."
-            )
-
-        if lock_acquired:
-            break
-
-        await asyncio.sleep(0.05)
-
-    if not lock_acquired:
-        raise HTTPException(
-            status_code=503,
-            detail="Otro usuario está reservando este producto. Reintentá."
-        )
+    start_request_time = time.time()
 
     try:
-        result = await db.execute(
-            select(Product).where(Product.id == request.product_id)
-        )
-        product = result.scalar_one_or_none()
-
-        if not product:
-            raise HTTPException(
-                status_code=404,
-                detail="Producto no encontrado"
-            )
-
-        if product.stock < request.quantity:
+        if request.quantity <= 0:
+            reserve_attempts_total.labels(result="invalid_quantity").inc()
             raise HTTPException(
                 status_code=400,
-                detail="Sin stock suficiente"
+                detail="La cantidad debe ser mayor a 0"
             )
 
-        product.stock -= request.quantity
-        await db.commit()
-        await db.refresh(product)
+        lock_key = f"lock:product:{request.product_id}"
+        lock_value = "reserved"
 
-        return {
-            "status": "reserved",
-            "product_id": product.id,
-            "quantity": request.quantity,
-            "stock_remaining": product.stock
-        }
+        lock_acquired = False
+        start_lock_time = time.time()
+
+        while time.time() - start_lock_time < 5:
+            try:
+                lock_acquired = redis_client.set(
+                    lock_key,
+                    lock_value,
+                    nx=True,
+                    ex=5
+                )
+            except redis.exceptions.RedisError:
+                reserve_attempts_total.labels(result="redis_error").inc()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Redis no disponible. Reintentá más tarde."
+                )
+
+            if lock_acquired:
+                break
+
+            await asyncio.sleep(0.05)
+
+        if not lock_acquired:
+            reserve_attempts_total.labels(result="lock_busy").inc()
+            raise HTTPException(
+                status_code=503,
+                detail="Otro usuario está reservando este producto. Reintentá."
+            )
+
+        try:
+            result = await db.execute(
+                select(Product).where(Product.id == request.product_id)
+            )
+            product = result.scalar_one_or_none()
+
+            if not product:
+                reserve_attempts_total.labels(result="not_found").inc()
+                raise HTTPException(
+                    status_code=404,
+                    detail="Producto no encontrado"
+                )
+
+            inventory_stock_level.labels(product_id=str(product.id)).set(product.stock)
+
+            if product.stock < request.quantity:
+                reserve_attempts_total.labels(result="no_stock").inc()
+                raise HTTPException(
+                    status_code=400,
+                    detail="Sin stock suficiente"
+                )
+
+            product.stock -= request.quantity
+            await db.commit()
+            await db.refresh(product)
+
+            inventory_stock_level.labels(product_id=str(product.id)).set(product.stock)
+            reserve_attempts_total.labels(result="success").inc()
+
+            return {
+                "status": "reserved",
+                "product_id": product.id,
+                "quantity": request.quantity,
+                "stock_remaining": product.stock
+            }
+
+        finally:
+            try:
+                redis_client.delete(lock_key)
+            except redis.exceptions.RedisError:
+                pass
 
     finally:
-        try:
-            redis_client.delete(lock_key)
-        except redis.exceptions.RedisError:
-            pass
+        reserve_duration_seconds.observe(time.time() - start_request_time)
